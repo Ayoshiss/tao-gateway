@@ -124,14 +124,37 @@ class MinerHandler:
     # -- routes ----------------------------------------------------------------
 
     def _health(self) -> Response:
-        """Unauthenticated liveness. Advertises identity, never secrets."""
-        return Response(200, {
+        """Unauthenticated liveness. Advertises identity, never secrets.
+
+        How a caller should check this miner's proofs depends on what is signing
+        them, so the answer says which. A mock publishes a bare Ed25519 key. Real
+        silicon has no such key to publish and publishes AMD's certificates
+        instead, which is what lets a validator verify without reaching KDS.
+
+        Handing out the certificates gives an attacker nothing: they are public
+        by design, and the chain is checked against a root pinned in the
+        verifier, so a substituted one fails.
+        """
+        body: dict[str, object] = {
             "ok": True,
             "hotkey": self.hotkey_ss58,
             "chip_id": self.enclave.chip_id,
-            "public_key": self.enclave.public_key_hex,
             "launch_measurement": self.enclave.launch_measurement,
-        })
+        }
+
+        certificates = getattr(self.enclave.silicon, "certificates", None)
+        if certificates:
+            import base64
+
+            body["attestation"] = "sev-snp"
+            body["certificates"] = {
+                name: base64.b64encode(der).decode()
+                for name, der in certificates.items()
+            }
+        else:
+            body["attestation"] = "mock"
+            body["public_key"] = self.enclave.public_key_hex
+        return Response(200, body)
 
     def _call(self, request: Request, caller: http_auth.Caller) -> Response:
         """Execute one MCP tool call inside the enclave and attest the result."""

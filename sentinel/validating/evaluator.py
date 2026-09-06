@@ -81,9 +81,21 @@ class MinerEvaluator:
         latency_target_ms: float = DEFAULT_LATENCY_TARGET_MS,
         latency_ceiling_ms: float = DEFAULT_LATENCY_CEILING_MS,
         timeout: float = 30.0,
+        product: str = "Milan",
+        sevsnp_min_tcb: Mapping[str, int] | None = None,
     ) -> None:
         self.wallet = wallet
         self.approved_measurement = approved_measurement
+        #: EPYC product line, which selects AMD's root. Wrong here means every
+        #: real-silicon miner fails, so it is explicit rather than sniffed.
+        self.product = product
+        #: `min_tcb` is one integer and a real TCB is four components, so the
+        #: hardware floor cannot be derived from it and is set separately.
+        #: Empty means no floor: approved code on vulnerable firmware still
+        #: passes, which is a gap and is tracked in ROADMAP.md. Populating it
+        #: needs a decision about which firmware levels to require, and getting
+        #: that wrong locks honest miners out of the subnet.
+        self.sevsnp_min_tcb = dict(sevsnp_min_tcb or {})
         self.min_tcb = min_tcb
         self.latency_target_ms = latency_target_ms
         self.latency_ceiling_ms = latency_ceiling_ms
@@ -133,10 +145,11 @@ class MinerEvaluator:
 
         try:
             health = client.health()
-            public_key = health.get("public_key")
-            if not public_key:
-                outcome.error = "health did not advertise a public key"
-                return outcome
+            if health.get("attestation") != "sev-snp":
+                public_key = health.get("public_key")
+                if not public_key:
+                    outcome.error = "health did not advertise a public key"
+                    return outcome
 
             nonce = new_nonce()
             request_id = f"probe-{nonce[:12]}"
@@ -169,15 +182,19 @@ class MinerEvaluator:
         # valid report at all.
         outcome.scores.nonce_discipline = 1.0 if report.nonce == nonce else 0.0
 
+        binding = bind_response(request_id, outcome.response_hash or "")
         try:
-            verify(
-                report,
-                verifier_from_public_key(public_key),
-                approved_measurement=self.approved_measurement,
-                expected_nonce=nonce,
-                min_tcb=self.min_tcb,
-                expected_report_data=bind_response(request_id, outcome.response_hash or ""),
-            )
+            if health.get("attestation") == "sev-snp":
+                self._verify_sevsnp(report, health, binding, expected_nonce=nonce)
+            else:
+                verify(
+                    report,
+                    verifier_from_public_key(public_key),
+                    approved_measurement=self.approved_measurement,
+                    expected_nonce=nonce,
+                    min_tcb=self.min_tcb,
+                    expected_report_data=binding,
+                )
         except VerificationError as exc:
             outcome.error = f"attestation rejected: {exc}"
             return outcome
@@ -185,3 +202,71 @@ class MinerEvaluator:
         outcome.verified = True
         outcome.scores.attestation = 1.0
         return outcome
+
+    def _verify_sevsnp(
+        self, report, health: dict[str, Any], binding: str, *, expected_nonce: str
+    ) -> None:
+        """Verify a real chip's report against AMD's chain, using the miner's certs.
+
+        The certificates come from the miner, which is the party being judged.
+        That is safe only because of what is not taken from it: the root is
+        pinned in `CertChain.verify_self`, so a miner that mints its own chain
+        fails here rather than passing with its own signature. What it buys is
+        that scoring never depends on AMD's KDS being up, and a KDS outage
+        cannot zero an honest miner's score.
+        """
+        import base64
+
+        from cryptography import x509
+
+        from ..sevsnp import SevSnpPolicy, SevSnpVerifier
+        from ..sevsnp.certs import CertChain
+
+        certificates = health.get("certificates") or {}
+        try:
+            certs = {n: base64.b64decode(v) for n, v in certificates.items()}
+        except Exception as exc:  # noqa: BLE001 - miner-supplied, treat as hostile
+            raise VerificationError(f"unreadable certificates: {exc}") from exc
+
+        missing = {"ASK", "ARK"} - set(certs)
+        leaf = certs.get("VCEK") or certs.get("VLEK")
+        if missing or leaf is None:
+            raise VerificationError(
+                "miner advertised SEV-SNP but not a full certificate chain"
+            )
+
+        try:
+            chain = CertChain(
+                product=self.product,
+                ask=x509.load_der_x509_certificate(certs["ASK"]),
+                ark=x509.load_der_x509_certificate(certs["ARK"]),
+            )
+            vcek = x509.load_der_x509_certificate(leaf)
+        except Exception as exc:  # noqa: BLE001 - malformed DER is a rejection
+            raise VerificationError(f"malformed certificate: {exc}") from exc
+
+        verifier = SevSnpVerifier(
+            self.product,
+            SevSnpPolicy(
+                approved_measurement=bytes.fromhex(self.approved_measurement),
+                **self.sevsnp_min_tcb,
+            ),
+            chain=chain,
+            offline=True,
+        )
+        # Proves the chip produced exactly this report. The report's own fields
+        # are checked separately below, because a genuine signature over the
+        # wrong claims is still the wrong claims.
+        verifier.verify_signed_message(report.canonical(), report.signature, vcek=vcek)
+
+        # The signature covers the nonce, but covering it and being the one we
+        # asked for are different claims. Checked explicitly rather than left to
+        # the binding: today request_id is derived from the nonce so a stale
+        # report fails anyway, and a validator should not depend on that holding.
+        if report.nonce != expected_nonce:
+            raise VerificationError("report answers a different nonce (replay)")
+
+        if report.report_data != binding:
+            raise VerificationError(
+                "response binding mismatch (proof is for a different response)"
+            )
