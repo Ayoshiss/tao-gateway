@@ -54,7 +54,8 @@ if __name__ == "__main__":
     p.add_argument("--netuid", type=int, default=554)
     # 554 is a testnet subnet. Publishing to finney would succeed against the
     # wrong chain and leave the miner undiscoverable with no error to show for it.
-    p.add_argument("--endpoint", default="test")
+    # --network is the spelling btcli uses, and operators type it by reflex.
+    p.add_argument("--endpoint", "--network", dest="endpoint", default="test")
     p.add_argument("--wallet", default="sentinel")
     p.add_argument("--hotkey", default="miner")
     p.add_argument("--wallet-path", default=None)
