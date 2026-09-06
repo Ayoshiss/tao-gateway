@@ -37,11 +37,12 @@ python3 -m venv .venv
 
 install -d -m 0750 -o sentinel -g sentinel /etc/sentinel
 cat >/etc/sentinel/miner.env <<'EOF'
-NETUID=554
-WALLET=sentinel
-HOTKEY=miner
-# Fill both of these in before starting the service.
-ADVERTISE_IP=
+# The miner's public address. No private key belongs on this machine: the
+# endpoint is published from wherever the wallet lives, with
+# scripts/publish_axon.py.
+HOTKEY_SS58=
+# Read once from this VM's own chip:
+#   sudo .venv/bin/python scripts/run_miner.py --print-measurement
 MEASUREMENT=
 EOF
 chmod 0640 /etc/sentinel/miner.env
@@ -51,4 +52,4 @@ chown -R sentinel:sentinel /opt/sentinel
 install -m 0644 /opt/sentinel/deploy/sentinel-miner.service /etc/systemd/system/
 systemctl daemon-reload
 
-echo "installed. Not started: /etc/sentinel/miner.env still needs ADVERTISE_IP and MEASUREMENT."
+echo "installed. Not started: /etc/sentinel/miner.env still needs HOTKEY_SS58 and MEASUREMENT."

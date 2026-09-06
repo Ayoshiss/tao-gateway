@@ -212,7 +212,17 @@ def main() -> int:
     p.add_argument("--netuid", type=int, default=554)
     p.add_argument("--wallet", default="sentinel")
     p.add_argument("--hotkey", default="miner")
-    p.add_argument("--endpoint", default="finney")
+    # Serve as this identity while holding none of its key material. The miner
+    # never signs with the hotkey: it verifies callers' signatures, and its own
+    # answers are signed by the chip. The private hotkey is needed only to
+    # publish the endpoint, which is one chain call that belongs on a machine
+    # you control rather than on a cloud VM someone else operates.
+    p.add_argument("--hotkey-ss58",
+                   help="serve under this address; publish the axon elsewhere")
+    # netuid 554 lives on testnet, not finney. Defaulting to finney would
+    # publish the endpoint on a chain the subnet is not on, and the failure
+    # is quiet: the miner serves happily and no validator ever finds it.
+    p.add_argument("--endpoint", default="test")
     p.add_argument("--advertise-ip", help="the address validators can reach")
     p.add_argument("--bind", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8091)
@@ -251,8 +261,11 @@ def main() -> int:
     if not args.no_chain and not args.advertise_ip:
         p.error("--advertise-ip is required (or --no-chain to serve without publishing)")
 
-    hotkey_ss58 = "mock-hotkey"
+    hotkey_ss58 = args.hotkey_ss58 or "mock-hotkey"
     wallet = None
+    if args.hotkey_ss58 and not args.no_chain:
+        p.error("--hotkey-ss58 serves without a wallet, so it needs --no-chain; "
+                "publish the axon from wherever the hotkey lives")
     if not args.no_chain:
         import bittensor as bt
 

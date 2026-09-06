@@ -8,11 +8,13 @@ Type=simple
 User=sentinel
 WorkingDirectory=/opt/sentinel
 EnvironmentFile=/etc/sentinel/miner.env
+# No wallet on this machine. The miner serves under HOTKEY_SS58, an address, and
+# holds none of its key material; the endpoint is published separately with
+# scripts/publish_axon.py from wherever the hotkey lives. A compromise of this
+# VM yields a miner that answers queries, not the neuron's identity.
 ExecStart=/opt/sentinel/.venv/bin/python scripts/run_miner.py \
-    --netuid ${NETUID} \
-    --wallet ${WALLET} \
-    --hotkey ${HOTKEY} \
-    --advertise-ip ${ADVERTISE_IP} \
+    --no-chain \
+    --hotkey-ss58 ${HOTKEY_SS58} \
     --measurement ${MEASUREMENT}
 
 # A miner that stops is a miner scoring zero, so always come back. Restarting
