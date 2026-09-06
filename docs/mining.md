@@ -2,44 +2,39 @@
 
 About an hour, most of it waiting for a VM to install packages.
 
-Read the two paragraphs below before you spend anything. They are the parts
-that are different from every other subnet you have mined.
+Read the next two sections before provisioning anything. They cover what is
+different here from other subnets, and what is not finished.
 
 ---
 
 ## What you are signing up for
 
 **Netuid 554 is on Bittensor testnet. There are no emissions.** Nothing here
-earns. If you are here to mine for reward, stop now, and thanks for reading this
-far. What this is worth doing for is telling us where it breaks.
+earns. The reason to run one is to evaluate the design and report what breaks.
 
 **A Sentinel miner needs a confidential VM, not spare capacity.** Most subnets
 let you point hardware you already own at the problem. This one cannot: the
 whole design rests on an AMD SEV-SNP processor proving which code is running
 before a credential is released to it. That means a specific machine type, and
-it costs roughly $30 a month on GCP spot pricing. If you are doing this as a
-favour, we should be paying for it. Ask.
+it costs roughly $30 a month on GCP spot pricing. Testnet miners can be
+subsidised; get in touch before paying for one yourself.
 
 **Every miner must run a byte-identical image.** The validator pins one approved
 launch measurement. A different image measures differently and scores zero. This
-is a real operational burden and we know it; it is one of the things we want your
-opinion on.
+is an operational burden and an open design question.
 
 ---
 
-## What is not yet true
-
-Say this plainly rather than have you find it.
+## Known limitation: the measurement does not cover application code
 
 The SEV-SNP launch measurement covers the boot state of the VM, not the Python
-application on top of it. We tested this on our own live miner: modifying the
-miner's code and the data it serves left the measurement byte-identical, and the
-validator still scored it 1.0. So today the chip proves what *booted*, not what
-is *running*.
+application on top of it. Tested on a live miner: modifying the miner's code and
+the data it served left the measurement byte-identical, and the validator still
+scored the attestation 1.0. The chip proves what *booted*, not what is *running*.
 
-Fixing that means binding the root filesystem into the measurement. It is the
-open problem, it is tracked, and it is not solved. You are looking at an
-incentive mechanism and a deployment path, not a finished security guarantee.
+Closing this means binding the root filesystem into the measurement. Until then,
+treat this as an incentive mechanism and a deployment path rather than a
+finished security guarantee.
 
 ---
 
@@ -109,10 +104,9 @@ gcloud compute ssh sentinel-miner-1 --zone=us-central1-a --command \
   'cd /opt/sentinel && sudo .venv/bin/python scripts/run_miner.py --print-measurement'
 ```
 
-If this does not match the measurement the validator has pinned, your miner will
-serve happily and score zero. Compare it against the value in TESTNET.md and
-tell us if it differs, because that is exactly the coordination problem we want
-to understand.
+If this does not match the measurement the validator has pinned, the miner will
+serve normally and score zero. Compare it against the value in TESTNET.md, and
+report a mismatch: image drift across miners is an open coordination problem.
 
 ## 5. Configure and start
 
@@ -168,7 +162,8 @@ reach AMD's key service.
 ## When it goes wrong
 
 **Miner exits with "launch measurement mismatch".** The image is not the one
-pinned. That is the gate doing its job. Read the running value and talk to us.
+pinned, which is the gate working as intended. Read the running value and report
+it.
 
 **`no /dev/sev-guest`.** The VM was not created as confidential. Check the
 instance was made with `--confidential-compute-type=SEV_SNP`.
@@ -183,11 +178,11 @@ wrong chain and leaves you invisible with no error anywhere.
 
 ---
 
-## What we want back
+## Feedback worth sending
 
-Not endorsements. The useful thing is what annoyed you.
+Criticism is more useful than approval. Specifically:
 
-- Where did this break, and how long did it actually take?
-- Would you run a paid confidential VM for a subnet? At what emission level?
-- The single-pinned-image requirement. Dealbreaker, or manageable?
-- What would make you not bother?
+- Where did this break, and how long did it take end to end?
+- Would you run a paid confidential VM for a subnet, and at what emission level?
+- Is the single-pinned-image requirement manageable or a dealbreaker?
+- What would stop you running one?
