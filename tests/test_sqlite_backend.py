@@ -120,3 +120,34 @@ def test_attested_flow_over_real_sql():
         )
     finally:
         db.close()
+
+
+def test_the_database_is_usable_from_the_threads_that_actually_serve():
+    """A miner answers each request on a new thread, so the DB must survive that.
+
+    SQLite binds a connection to its creating thread by default, which made
+    every validator challenge fail while the miner looked perfectly healthy:
+    it started, it served, its attestations verified, and only the answer was
+    an error. Cheap to assert, expensive to rediscover in production.
+    """
+    import threading
+
+    db = SqliteDatabase(
+        Credentials(dsn="sqlite:///", resource="customer-db"),
+        seed_sql="CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1),(2),(3);",
+    )
+    results: list[object] = []
+
+    def run() -> None:
+        try:
+            results.append(db.query("SELECT id FROM t ORDER BY id").rows)
+        except Exception as exc:  # noqa: BLE001 - the failure is the point
+            results.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == [[[1], [2], [3]]] * 8, results

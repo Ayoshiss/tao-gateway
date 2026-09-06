@@ -29,6 +29,7 @@ import pathlib
 import struct
 from typing import Final
 
+from .certtable import parse_cert_table
 from .report import REPORT_SIZE, parse_report
 
 logger = logging.getLogger("sentinel.sevsnp.guest")
@@ -264,6 +265,8 @@ class SevSnpSilicon:
         self.vmpl = vmpl
         self.device = device
         self._chip_id: str | None = None
+        self._certs: dict[str, bytes] | None = None
+        self._measurement: str | None = None
 
     @property
     def chip_id(self) -> str:
@@ -272,6 +275,44 @@ class SevSnpSilicon:
             blob = request_report(bytes(64), self.vmpl, self.device)
             self._chip_id = parse_report(blob).chip_id_hex
         return self._chip_id
+
+    @property
+    def certificates(self) -> dict[str, bytes]:
+        """The host's certificate table, as `{name: der}`.
+
+        A report on its own cannot be checked: verifying it needs the VCEK, and
+        historically that meant asking AMD's KDS. The extended report has the
+        host hand the chain over with the proof instead, which is what lets a
+        verifier work while AMD is unreachable. That is not hypothetical; KDS
+        was refusing connections the day this path was written.
+
+        Fetched once. The certificates are per-chip and per-firmware, so they do
+        not change underneath a running miner; a firmware update replaces the VM.
+        Empty when the host provisioned nothing, which callers must handle by
+        falling back to KDS rather than assuming certificates are always present.
+        """
+        if self._certs is None:
+            _, blob = request_ext_report(bytes(64), self.vmpl, self.device)
+            self._certs = parse_cert_table(blob)
+        return self._certs
+
+    @property
+    def measurement(self) -> str:
+        """The launch measurement of this VM, hex, from a report.
+
+        What the firmware hashed as it built the guest, so it identifies the
+        image that is running. A miner reports it; it does not get to decide it.
+        Cached because it is fixed for the life of the VM: changing the image
+        means a new launch, and a new launch means a new measurement.
+
+        Read this to *learn* the value once and pin it in a policy. Never read it
+        to *populate* the policy at startup, which would have the code being
+        checked supply the answer to the check.
+        """
+        if self._measurement is None:
+            blob = request_report(bytes(64), self.vmpl, self.device)
+            self._measurement = parse_report(blob).measurement.hex()
+        return self._measurement
 
     def sign(self, message: bytes) -> str:
         """A report bound to `message`, hex encoded.

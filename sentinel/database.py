@@ -126,13 +126,20 @@ class SqliteDatabase:
         seed_sql: str | None = None,
     ) -> None:
         import sqlite3
+        import threading
 
         self.credentials = credentials
         self.closed = False
         try:
-            self._conn = sqlite3.connect(path)
+            # The miner serves on a threading HTTP server, so queries arrive on
+            # whichever thread took the request, never the one that opened the
+            # connection. SQLite's default refuses that outright, which makes
+            # every challenge fail; the lock below is what makes lifting the
+            # check safe rather than merely quiet.
+            self._conn = sqlite3.connect(path, check_same_thread=False)
         except Exception as exc:
             raise QueryError(f"could not open {credentials.resource}: {exc}") from exc
+        self._lock = threading.Lock()
         self._conn.row_factory = sqlite3.Row
         if seed_sql:
             try:
@@ -144,17 +151,25 @@ class SqliteDatabase:
         if self.closed:
             raise QueryError("query on a closed database")
         try:
-            cur = self._conn.execute(sql, tuple(params))
+            # Held across the fetch, not just the execute: the cursor draws from
+            # the connection as it is read, so releasing early would let a
+            # concurrent query interleave and scramble both result sets.
+            with self._lock:
+                cur = self._conn.execute(sql, tuple(params))
+                if cur.description is None:  # non-SELECT
+                    return QueryResult(columns=[], rows=[])
+                columns = [d[0] for d in cur.description]
+                rows = [list(r) for r in cur.fetchall()]
+        except QueryError:
+            raise
         except Exception as exc:
             raise QueryError(f"query failed: {exc}") from exc
-        if cur.description is None:  # non-SELECT
-            return QueryResult(columns=[], rows=[])
-        columns = [d[0] for d in cur.description]
-        return QueryResult(columns=columns, rows=[list(r) for r in cur.fetchall()])
+        return QueryResult(columns=columns, rows=rows)
 
     def close(self) -> None:
         if not self.closed:
-            self._conn.close()
+            with self._lock:
+                self._conn.close()
             self.closed = True
 
 

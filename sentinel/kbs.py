@@ -66,11 +66,45 @@ def release_binding(resource: str) -> str:
     return bind_response("kbs-release", sha384(resource.encode()))
 
 
+#: A SEV-SNP report arrives as the whole 1184-byte structure, hex encoded, in the
+#: `signature` field. A mock Ed25519 signature is 64 bytes. Nothing else is near
+#: either length, so the shape identifies which verification path a report needs
+#: without the report having to announce it.
+SEVSNP_SIGNATURE_HEX_LEN = 1184 * 2
+
+
+def looks_like_sevsnp(signature_hex: str) -> bool:
+    """Whether this signature is a real SEV-SNP report rather than a mock one."""
+    return len(signature_hex) >= SEVSNP_SIGNATURE_HEX_LEN
+
+
 @dataclass
 class KeyBroker:
-    """Holds secrets; releases them only against a valid, fresh attestation."""
+    """Holds secrets; releases them only against a valid, fresh attestation.
+
+    Two kinds of proof reach `release()`, and they are verified differently.
+
+    A `MockSilicon` report is Ed25519 signed, so the broker checks it against a
+    public key registered in advance with `trust_chip`. That models a directory
+    of known-good chips and is what the development path uses.
+
+    A real SEV-SNP report cannot work that way, because a processor has no bare
+    public key to register. It is verified through AMD's certificate chain: the
+    report is signed by the chip's VCEK, the VCEK by AMD's signing key, and that
+    by AMD's root, which is pinned. Supply a `SevSnpVerifier` as `sevsnp` and the
+    broker routes real reports to it, ignoring the chip registry entirely.
+
+    Without a verifier configured, a real report is refused rather than falling
+    back to the registry. A broker that cannot check a proof must not release a
+    secret against it.
+    """
 
     policy: ReleasePolicy
+    #: Verifier for real hardware. `None` means this broker only accepts mocks.
+    sevsnp: object | None = None
+    #: Certificates the enclave supplied with its report, `{name: der}`. The
+    #: extended report carries these so verification never has to reach AMD.
+    sevsnp_certs: dict[str, bytes] = field(default_factory=dict, repr=False)
     _secrets: dict[str, Credentials] = field(default_factory=dict, repr=False)
     _trusted_chips: dict[str, str] = field(default_factory=dict, repr=False)
     _issued_nonces: dict[str, float] = field(default_factory=dict, repr=False)
@@ -113,14 +147,26 @@ class KeyBroker:
         if report.nonce not in self._issued_nonces:
             raise CredentialReleaseError("unknown or expired nonce (replayed attestation)")
 
-        # Chip identity: an unregistered chip is not a chip we will trust.
+        # Real silicon and mock silicon prove themselves differently, so the
+        # shape of the signature decides which check applies.
+        if looks_like_sevsnp(report.signature):
+            self._verify_sevsnp(report, resource)
+        else:
+            self._verify_registered_key(report, resource)
+
+        # Spend the nonce so this proof cannot unlock anything twice.
+        self._issued_nonces.pop(report.nonce, None)
+        return self._secrets[resource]
+
+    # -- internals -------------------------------------------------------------
+
+    def _verify_registered_key(self, report: AttestationReport, resource: str) -> None:
+        """The development path: an Ed25519 key registered in advance."""
         public_key = self._trusted_chips.get(report.chip_id)
         if public_key is None:
             raise CredentialReleaseError(
                 f"chip {report.chip_id!r} is not a trusted processor"
             )
-
-        # Full attestation check: signature, image, TCB, freshness, resource binding.
         try:
             verify(
                 report,
@@ -133,11 +179,50 @@ class KeyBroker:
         except VerificationError as exc:
             raise CredentialReleaseError(f"attestation rejected: {exc}") from exc
 
-        # Spend the nonce so this proof cannot unlock anything twice.
-        self._issued_nonces.pop(report.nonce, None)
-        return self._secrets[resource]
+    def _verify_sevsnp(self, report: AttestationReport, resource: str) -> None:
+        """The hardware path: AMD's certificate chain, anchored to a pinned root.
 
-    # -- internals -------------------------------------------------------------
+        The chip registry is deliberately not consulted. A processor's identity
+        comes from a VCEK that chains to AMD, not from a key someone remembered
+        to add to a list, and consulting both would mean the weaker check could
+        admit what the stronger one refuses.
+        """
+        if self.sevsnp is None:
+            raise CredentialReleaseError(
+                "a SEV-SNP report was presented but this broker has no verifier "
+                "configured; refusing to release against a proof it cannot check"
+            )
+
+        leaf = self.sevsnp_certs.get("VCEK") or self.sevsnp_certs.get("VLEK")
+        if leaf is None:
+            raise CredentialReleaseError(
+                "no VCEK available for this chip; the host provisioned no "
+                "certificates and AMD's KDS was not consulted"
+            )
+
+        from cryptography import x509
+
+        # The chip signs the canonical report, not the resource binding directly,
+        # so REPORT_DATA holds SHA-512 of that JSON. `verify_signed_message`
+        # recomputes it, which is what ties the signature to this exact nonce,
+        # chip and binding rather than to any report the chip ever produced.
+        try:
+            self.sevsnp.verify_signed_message(
+                report.canonical(),
+                report.signature,
+                vcek=x509.load_der_x509_certificate(leaf),
+            )
+        except VerificationError as exc:
+            raise CredentialReleaseError(f"attestation rejected: {exc}") from exc
+
+        # The signature proves the chip produced this report. It says nothing
+        # about which secret the report was asking for, so check that separately:
+        # otherwise a proof obtained for the analytics database would unlock the
+        # payments one.
+        if report.report_data != release_binding(resource):
+            raise CredentialReleaseError(
+                "attestation is bound to a different resource"
+            )
 
     def _expire_nonces(self) -> None:
         now = time.monotonic()

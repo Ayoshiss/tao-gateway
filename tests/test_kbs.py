@@ -139,3 +139,132 @@ def test_failed_unlock_leaves_no_credential_in_enclave():
     with pytest.raises(CredentialReleaseError):
         rogue.unlock(broker, RESOURCE)
     assert rogue.credential_for(RESOURCE) is None
+
+
+# --- the hardware path: AMD's chain instead of a registered key ----------------
+
+import pathlib as _pathlib
+
+import pytest as _pytest
+
+from sentinel.attestation import AttestationReport
+from sentinel.kbs import looks_like_sevsnp, release_binding
+
+_HOST = _pathlib.Path(__file__).parent / "fixtures" / "gcp-host-certs"
+_REPORT = _HOST / "sevsnp-report-20260831T061928Z.bin"
+needs_hw_fixtures = _pytest.mark.skipif(
+    not _REPORT.exists(), reason="hardware fixtures not present"
+)
+
+
+def test_report_kind_is_read_from_its_shape():
+    """A real report is the whole 1184-byte structure; a mock one is 64 bytes.
+
+    Nothing else is near either length, so the broker can route without the
+    report having to declare which kind it is, and without a caller being able
+    to claim the cheaper check by lying about it.
+    """
+    assert looks_like_sevsnp("aa" * 1184)
+    assert not looks_like_sevsnp("aa" * 64)
+    assert not looks_like_sevsnp("")
+
+
+def test_sevsnp_report_is_refused_when_no_verifier_is_configured():
+    """A broker that cannot check a proof must not release a secret against it.
+
+    The dangerous failure would be falling back to the chip registry, because
+    then a real report from an unregistered chip would be judged by the weaker
+    check and could be admitted by it.
+    """
+    broker = KeyBroker(policy=ReleasePolicy(approved_measurement="whatever"))
+    broker.store_secret("customer-db", "postgres://u:p@h/db")
+    nonce = broker.challenge()
+    report = AttestationReport(
+        chip_id="F1CF2D6F", launch_measurement="whatever", tcb_level=9,
+        nonce=nonce, report_data=release_binding("customer-db"),
+        signature="ab" * 1184,
+    )
+    with pytest.raises(CredentialReleaseError, match="no verifier"):
+        broker.release("customer-db", report)
+
+
+@needs_hw_fixtures
+def test_sevsnp_report_is_refused_when_the_host_supplied_no_certificates():
+    """Without a VCEK there is nothing to check the signature against."""
+    from sentinel.sevsnp import SevSnpPolicy, SevSnpVerifier
+    from sentinel.sevsnp.certs import CertChain
+    from cryptography import x509
+
+    certs = {n: (_HOST / f"{n}.der").read_bytes() for n in ("ASK", "ARK")}
+    chain = CertChain(product="Milan",
+                      ask=x509.load_der_x509_certificate(certs["ASK"]),
+                      ark=x509.load_der_x509_certificate(certs["ARK"]))
+    verifier = SevSnpVerifier("Milan", SevSnpPolicy(approved_measurement=b"\x00" * 48),
+                              chain=chain, offline=True)
+
+    broker = KeyBroker(policy=ReleasePolicy(approved_measurement="x"), sevsnp=verifier)
+    broker.store_secret("customer-db", "postgres://u:p@h/db")
+    nonce = broker.challenge()
+    report = AttestationReport(
+        chip_id="F1CF2D6F", launch_measurement="x", tcb_level=9, nonce=nonce,
+        report_data=release_binding("customer-db"), signature="ab" * 1184,
+    )
+    with pytest.raises(CredentialReleaseError, match="no VCEK"):
+        broker.release("customer-db", report)
+
+
+@needs_hw_fixtures
+def test_a_forged_sevsnp_report_does_not_release_the_secret():
+    """Bytes that are not a genuine report must be refused by the chain check.
+
+    This is the case the registered-key path could never express: the report is
+    the right shape and claims a real chip ID, and it still fails because no AMD
+    key signed it.
+    """
+    from sentinel.sevsnp import SevSnpPolicy, SevSnpVerifier, parse_report
+    from sentinel.sevsnp.certs import CertChain
+    from cryptography import x509
+
+    real = _REPORT.read_bytes()
+    certs = {n: (_HOST / f"{n}.der").read_bytes() for n in ("VCEK", "ASK", "ARK")}
+    chain = CertChain(product="Milan",
+                      ask=x509.load_der_x509_certificate(certs["ASK"]),
+                      ark=x509.load_der_x509_certificate(certs["ARK"]))
+    verifier = SevSnpVerifier(
+        "Milan",
+        SevSnpPolicy(approved_measurement=parse_report(real).measurement),
+        chain=chain, offline=True,
+    )
+
+    broker = KeyBroker(policy=ReleasePolicy(approved_measurement="x"),
+                       sevsnp=verifier, sevsnp_certs=certs)
+    broker.store_secret("customer-db", "postgres://u:p@h/db")
+
+    # a genuine-looking report with one byte of the signed body altered
+    forged = bytearray(real)
+    forged[0x090] ^= 0xFF
+    nonce = broker.challenge()
+    report = AttestationReport(
+        chip_id="F1CF2D6F", launch_measurement="x", tcb_level=9, nonce=nonce,
+        report_data=release_binding("customer-db"), signature=bytes(forged).hex(),
+    )
+    with pytest.raises(CredentialReleaseError, match="attestation rejected"):
+        broker.release("customer-db", report)
+
+
+def test_mock_reports_still_take_the_registered_key_path():
+    """The development path must keep working unchanged."""
+    from sentinel.attestation import MockSilicon
+
+    silicon = MockSilicon()
+    broker = KeyBroker(policy=ReleasePolicy(approved_measurement="img-v1"))
+    broker.store_secret("customer-db", "postgres://u:p@h/db")
+    broker.trust_chip(silicon.chip_id, silicon.public_verifier().public_key_hex)
+
+    from sentinel.attestation import AttestationAgent
+
+    agent = AttestationAgent(silicon, "img-v1", tcb_level=9)
+    nonce = broker.challenge()
+    report = agent.attest(nonce, release_binding("customer-db"))
+    assert not looks_like_sevsnp(report.signature)
+    assert broker.release("customer-db", report).dsn.startswith("postgres://")

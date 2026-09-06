@@ -1,0 +1,43 @@
+[Unit]
+Description=Sentinel miner, netuid 554
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+WorkingDirectory=/opt/sentinel
+EnvironmentFile=/etc/sentinel/miner.env
+ExecStart=/opt/sentinel/.venv/bin/python scripts/run_miner.py \
+    --netuid ${NETUID} \
+    --wallet ${WALLET} \
+    --hotkey ${HOTKEY} \
+    --advertise-ip ${ADVERTISE_IP} \
+    --measurement ${MEASUREMENT}
+
+# A miner that stops is a miner scoring zero, so always come back. Restarting
+# does not weaken anything: the measurement is re-read from the chip on every
+# start, so a tampered image fails at boot instead of quietly restarting into
+# service.
+Restart=always
+RestartSec=10
+
+# The credential lives in this process's memory and nowhere else. These stop it
+# reaching a disk or another user by accident; they are hygiene, not the
+# security boundary, which is the chip.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sentinel
+# The one device that must stay reachable: without it there is no attestation
+# and the miner refuses to start.
+DeviceAllow=/dev/sev-guest rw
+
+# Journald only. The credential is never logged, but a log file on disk is one
+# more thing to reason about.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
